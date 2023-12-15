@@ -205,7 +205,7 @@ def make_minigrid_env(id: str):
     def _init():
         env = gym.make(id)
         env = RGBImgPartialObsWrapper(env)
-        env = ImgObsWrapper(env)
+        # env = ImgObsWrapper(env)
         return env
 
     return _init
@@ -288,6 +288,7 @@ class RolloutBuffer(BaseBuffer):
         self.gamma = gamma
         self.observations, self.actions, self.rewards, self.advantages = None, None, None, None
         self.returns, self.episode_starts, self.values, self.log_probs = None, None, None, None
+        self.instrs = None
         self.dones = None
         self.generator_ready = False
         self.hidden_dim = hidden_dim
@@ -305,6 +306,7 @@ class RolloutBuffer(BaseBuffer):
         self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.instrs = np.empty((self.buffer_size, self.n_envs), dtype=object)
         self.generator_ready = False
         super(RolloutBuffer, self).reset()
 
@@ -354,7 +356,8 @@ class RolloutBuffer(BaseBuffer):
         reward: np.ndarray,
         episode_start: np.ndarray,
         value: th.Tensor,
-        log_prob: th.Tensor
+        log_prob: th.Tensor,
+        instr: object
     ) -> None:
         """
         :param obs: Observation
@@ -383,6 +386,7 @@ class RolloutBuffer(BaseBuffer):
         self.episode_starts[self.pos] = np.array(episode_start).copy()
         self.values[self.pos] = np.array(value).copy()
         self.log_probs[self.pos] = np.array(log_prob).copy()
+        self.instrs[self.pos] = np.array(instr).copy()
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -401,6 +405,7 @@ class RolloutBuffer(BaseBuffer):
                 "log_probs",
                 "advantages",
                 "returns",
+                "instrs"
             ]
             if self.hidden_dim:
                 _tensor_names.append("hiddens")
@@ -431,7 +436,7 @@ class RolloutBuffer(BaseBuffer):
             self.returns[batch_inds].flatten(),
         )
         data = RolloutBufferSamples(*tuple(map(self.to_torch, data)))
-        return data
+        return data, self.instrs[batch_inds]
 
 
 class RecurrentRolloutBuffer(BaseBuffer):

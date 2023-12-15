@@ -6,6 +6,9 @@ import numpy as np
 import clip
 import os
 from clip.simple_tokenizer import SimpleTokenizer
+from transformers import AutoTokenizer
+import math
+import torch.nn.init as init
 
 
 class DiscreteActor(nn.Module):
@@ -240,7 +243,61 @@ class HELMv2(nn.Module):
         value = self.critic(hidden).squeeze()
 
         return value, log_prob, entropy
+    
+class ResidualBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(ResidualBlock, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        init.kaiming_normal_(self.fc1.weight, mode='fan_in', nonlinearity='relu')
+        init.zeros_(self.fc1.bias)
 
+        self.bn = nn.BatchNorm1d(hidden_dim)
+        self.relu = nn.ReLU()
+
+        self.fc2 = nn.Linear(hidden_dim, input_dim)
+        nn.init.eye_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        residual = x
+        out = self.fc1(x)
+        out = self.relu(out)
+        out = self.fc2(out)
+        out += residual
+        out = self.bn(out)
+        return out
+
+    
+class TextEmbeddingModel(nn.Module):
+    def __init__(self, embed_dim, num_heads, max_sequence_length, device='cpu'):
+        super(TextEmbeddingModel, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.max_sequence_length = max_sequence_length
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        vocab_size = self.tokenizer.vocab_size
+        self.embedding = nn.Embedding(vocab_size, embed_dim).to(device)
+        self.multihead_attention = nn.MultiheadAttention(embed_dim, num_heads).to(device)
+        self.positional_encodings = self._generate_positional_encodings(max_sequence_length, embed_dim)
+
+    def forward(self, text):
+        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False)['input_ids'].to(self.device)
+        text_tokens = self.embedding(text_tokens)
+        text_tokens = text_tokens + self.positional_encodings[:, :text_tokens.size(1)].to(self.device)
+        text_tokens = text_tokens.permute(1, 0, 2)  # (seq_len, batch_size, embed_dim)
+        output, _ = self.multihead_attention(text_tokens, text_tokens, text_tokens)
+        output = output.permute(1, 0, 2)  # (batch_size, seq_len, embed_dim)
+        # average_embedding = torch.mean(output, dim=1)  # (batch_size, embed_dim)
+        return output
+
+    def _generate_positional_encodings(self, max_length, embed_dim):
+        position = torch.arange(0, max_length).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_dim, 2) * -(math.log(10000.0) / embed_dim))
+        positional_encodings = torch.zeros(1, max_length, embed_dim)
+        positional_encodings[:, :, 0::2] = torch.sin(position * div_term)
+        positional_encodings[:, :, 1::2] = torch.cos(position * div_term)
+        return positional_encodings
 
 class SHELM(nn.Module):
     def __init__(self, action_space, input_dim, optimizer, learning_rate, env_id, topk=1, epsilon=1e-8, mem_len=511,
@@ -249,8 +306,11 @@ class SHELM(nn.Module):
         config = TransfoXLConfig()
         config.mem_len = mem_len
         self.mem_len = config.mem_len
+        self.device = device
 
-        self.model = TransfoXLModel.from_pretrained('transfo-xl-wt103', config=config)
+        self.model = TransfoXLModel.from_pretrained('transfo-xl-wt103', config=config).to(device)
+        # print(f'device: {device}')
+        # self.resblock1 = ResidualBlock(input_dim=1024, hidden_dim=512).to(device)
         self.clip_tokenizer = SimpleTokenizer()
         self.tokenizer = TransfoXLTokenizer.from_pretrained('transfo-xl-wt103')
         if 'psychlab' in env_id:
@@ -260,10 +320,11 @@ class SHELM(nn.Module):
         self.lexical_overlap = np.load(os.path.join('data', 'clip_transfo-xl-wt103_intersect.npz'))
         self.clip_embs = torch.FloatTensor(self.clip_embs[self.lexical_overlap]).cuda()
         n_tokens = self.model.word_emb.n_token
-        self.word_embs = self.model.word_emb(torch.arange(n_tokens)).detach().to(device)
+        self.word_embs = self.model.word_emb(torch.arange(n_tokens, device=device)).to(device)
         self.topk = topk
 
-        self.vis_encoder = VisionBackbone(clip_encoder)
+        self.vis_encoder = VisionBackbone(clip_encoder).to(device)
+        self.resblock2 = ResidualBlock(input_dim=512, hidden_dim=256).to(device)
         hidden_dim = self.model.d_embed
 
         for p in self.model.parameters():
@@ -272,13 +333,17 @@ class SHELM(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
 
-        self.query_encoder = SmallImpalaCNN(input_dim, channel_scale=4, hidden_dim=hidden_dim)
-        self.out_dim = hidden_dim*2
+        self.query_encoder = SmallImpalaCNN(input_dim, channel_scale=4, hidden_dim=hidden_dim).to(device)
+        self.out_dim = hidden_dim*3
         self.actor = DiscreteActor(self.out_dim, 128, action_space.n).apply(orthogonal_init)
         self.critic = nn.Sequential(nn.Linear(self.out_dim, 512),
                                     nn.LayerNorm(512, elementwise_affine=False),
                                     nn.ReLU(),
                                     nn.Linear(512, 1)).apply(orthogonal_init)
+        self.instr_att = TextEmbeddingModel(hidden_dim, 1, 32, device)
+        self.ll = torch.nn.Linear(512, 1024).to(device)
+        self.action_embedding = nn.Embedding(num_embeddings=7, embedding_dim=512).to(device)
+        
         try:
             self.optimizer = getattr(torch.optim, optimizer)(self.yield_trainable_params(), lr=learning_rate,
                                                              eps=epsilon)
@@ -312,7 +377,7 @@ class SHELM(nn.Module):
         embs = torch.stack(embs)
         return embs, decoded
 
-    def forward(self, observations):
+    def forward(self, observations, instr):
         if observations.shape[1] != 3:
             bs, h, w, c = observations.shape
             observations = observations.reshape(bs, c, h, w)
@@ -328,21 +393,57 @@ class SHELM(nn.Module):
         hidden = out.last_hidden_state[:, -1, :]
         hiddens = out.last_hidden_state[:, -1, :].cpu().numpy()
 
-        hidden = torch.cat([hidden, obs_query], dim=-1)
+        instr = instr.tolist()
+        instr_embeds = self.instr_att(instr)
+        instr_embed = torch.mean(instr_embeds, dim=1)
+        
+        hidden = torch.cat([hidden, instr_embed, obs_query], dim=-1)
 
         action, log_prob = self.actor(hidden)
         values = self.critic(hidden).squeeze()
 
         return action.cpu().numpy(), values.cpu().numpy(), log_prob.cpu().numpy().squeeze(), hiddens
+    
+    def clip_forward(self, observations, actions):
+        if observations.shape[1] != 3:
+            bs, h, w, c = observations.shape
+            observations = observations.reshape(bs, c, h, w)
+        else:
+            bs, *_ = observations.shape
+        observations = self.vis_encoder(observations)
+        # observations = self.query_encoder(observations)
+        actions = torch.tensor(actions).to(self.device)
+        actions = self.action_embedding(actions)
+        observations = torch.add(observations, actions)
+        return  observations
+    
+    def get_instr_embeddings(self, instrs):
+        embeddings = []
+        for i in range(len(instrs)):
+            instr = instrs[i].tolist()
+            instr_embed = self.instr_att(instr)
+            embeddings.append(instr_embed)
+        embeddings = torch.stack(embeddings)
+        return  torch.squeeze(embeddings)
+    
+    def up_project(self, frame_embeddings):
+        shape = frame_embeddings.shape
+        frame_embeddings = frame_embeddings.reshape(shape[0] * shape[1], shape[2])
+        embeddings = self.ll(frame_embeddings)
+        embeddings = embeddings.reshape(shape[0], shape[1], -1)
+        return  embeddings
 
-    def evaluate_actions(self, hidden_states, actions, observations):
+    def evaluate_actions(self, hidden_states, actions, observations, instr):
+        instr = instr.tolist()
+        instr_embeds = self.instr_att(instr)
+        instr_embed = torch.mean(instr_embeds, dim=1)
         if observations.shape[1] != 3:
             bs, h, w, c = observations.shape
             observations = observations.reshape(bs, c, h, w)
         else:
             bs, *_ = observations.shape
         queries = self.query_encoder(observations)
-        hidden = torch.cat([hidden_states, queries], dim=-1)
+        hidden = torch.cat([hidden_states, instr_embed, queries], dim=-1)
 
         log_prob, entropy = self.actor.evaluate(hidden, actions)
         value = self.critic(hidden).squeeze()

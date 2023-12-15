@@ -28,7 +28,7 @@ class Experiment:
             env = VecMonitor(env)
         elif 'MiniGrid' in self.config['env']:
             env = DummyVecEnv([make_minigrid_env(self.config['env']) for _ in range(self.config['n_envs'])])
-            env = VecNormalize(VecMonitor(env), norm_reward=True, norm_obs=False, clip_reward=1.)
+            env = VecNormalize(VecMonitor(env), norm_reward=True, norm_obs=False, clip_reward=1., norm_obs_keys=['image'])
         elif 'MiniWorld' in self.config['env']:
             env = DummyVecEnv([make_miniworld_env(self.config['env']) for _ in range(self.config['n_envs'])])
             env = VecNormalize(VecMonitor(env), norm_reward=True, norm_obs=False, clip_reward=1.)
@@ -42,6 +42,7 @@ class Experiment:
         assert self.config['model'] in ['SHELM', 'HELMv2', 'HELM', 'Impala-PPO', 'CNN-PPO'], \
             f"Model type {self.config['model']} not recognized!"
 
+        policy = "MlpPolicy"
         if self.config['model'] == 'HELM':
             from trainers.helm_trainer import HELMPPO
             trainer = HELMPPO
@@ -54,11 +55,12 @@ class Experiment:
         elif self.config['model'] == 'SHELM':
             from trainers.shelm_trainer import SHELMPPO
             trainer = SHELMPPO
+            policy = "MultiInputPolicy"
         else:
             from trainers.cnn_trainer import CNNPPO
             trainer = CNNPPO
 
-        model = trainer("MlpPolicy", env, verbose=1, tensorboard_log=self.outpath,
+        model = trainer(policy, env, verbose=1, tensorboard_log=self.outpath,
                         lr_decay=self.config['lr_decay'], ent_coef=self.config['ent_coef'],
                         ent_decay=self.config['ent_decay'], learning_rate=self.config['learning_rate'],
                         vf_coef=self.config['vf_coef'], n_epochs=int(self.config['n_epochs']),
@@ -71,7 +73,10 @@ class Experiment:
                         clip_range_vf=self.config['clip_range_vf'], seed=seed,
                         max_grad_norm=self.config['max_grad_norm'],
                         adv_norm=self.config.get('adv_norm', False),
-                        save_ckpt=self.config.get('save_ckpt', False))
+                        save_ckpt=self.config.get('save_ckpt', False), use_aux=self.config.get('use_aux', False),
+                        apply_instruction_tracking=self.config.get('apply_instruction_tracking', False),
+                        threshold=self.config['threshold']
+                        )
 
         model.learn(total_timesteps=self.config['n_steps'], eval_log_path=self.outpath)
 

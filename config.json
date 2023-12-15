@@ -21,7 +21,7 @@
     "mem_len": 511,
     "min_ent_coef": 0,
     "min_lr": 0,
-    "model": "HELM",
+    "model": "SHELM",
     "n_envs": 16,
     "n_epochs": 3,
     "n_rollout_steps": 128,
@@ -30,6 +30,9 @@
     "start_fraction": 0,
     "epsilon": 1e-8,
     "vf_coef": 0.5,
-    "seed": null,
-    "topk": 1
+    "seed": 20,
+    "topk": 1,
+    "use_aux": true,
+    "apply_instruction_tracking": true,
+    "threshold": 2
 }

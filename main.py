@@ -33,6 +33,7 @@ def parse_variable_assignment(assignments):
 
 def run(config, run_id=None, seed=None):
     exp = Experiment(config, experiment_id=run_id)
+    print(f'seed: {seed}')
     exp.run(seed=seed)
 
 
@@ -54,7 +55,7 @@ def main():
     else:
         run_id = None
 
-    p = Process(target=run, args=(config, run_id, options.seed))
+    p = Process(target=run, args=(config, run_id, config['seed']))
     p.start()
     p.join()
 
