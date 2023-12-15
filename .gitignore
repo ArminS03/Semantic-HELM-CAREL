@@ -1,4 +1,11 @@
 __pycache__
+
 .idea
+
 experiments
+
 data/
+
+lab/
+
+gym-miniworld/
